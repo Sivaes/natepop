@@ -1,0 +1,234 @@
+# Nate Pop: body flips from a flat-ground flip trick (like Skate 3's nate pop).
+#
+# Self-contained: put this one file at .github/workflows/build-nate-pop.yml in any GitHub repo
+# (the empty Sivaes/natepop works; GitHub's web "Add file > Create new file" is fine).
+# Actions > Build Nate Pop > Run workflow. It checks out ReSkate's public source at the tag you
+# pick, adds Nate Pop, builds on Windows and uploads ReSkate.dll + ReSkateLauncher.exe.
+#
+# In game: console (~) `natepop 1` on, `natepop 0` off. Off at every launch.
+# Game build 25414733 (Skate.exe SHA-256 fbce74d5...88b8f9), the one ReSkate 1.1.1 to 2.1.2 support.
+
+name: Build Nate Pop
+
+on:
+  workflow_dispatch:
+    inputs:
+      reskate_ref:
+        description: "ReSkate tag to build on (v1.1.1 ... v2.1.2)"
+        default: "v2.1.2"
+        required: true
+  push:
+    paths:
+      - ".github/workflows/build-nate-pop.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      RESKATE_REF: ${{ github.event.inputs.reskate_ref || 'v2.1.2' }}
+    steps:
+      - name: Check out ReSkate ${{ env.RESKATE_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: Dingo-Shenanigans/ReSkate
+          ref: ${{ env.RESKATE_REF }}
+          path: reskate
+
+      - name: Add Nate Pop
+        shell: bash
+        working-directory: reskate
+        run: |
+          set -euo pipefail
+          mkdir -p Engine/Game/Build/20260929 Extension/Skater
+
+          cat > Engine/Game/Build/20260929/nate_pop.h <<'NATEPOP_EOF'
+          #pragma once
+          #include "Engine/Game/Build/fingerprint.h"
+
+          namespace dingosdk::game::build::v20260929::nate_pop {
+          // Supported SHA-256 fbce74d5e28ef525dbba2cb4adbebc13405bdbd88f31bc940bca45e4ae88b8f9.
+          //
+          // The body flip gate. The air state's per-tick body flip update (0x4814840) starts a body flip
+          // only when a flip is requested (context +0x13c8 & 0x18) and the jump's estimated air time
+          // (air state +0x418) is longer than a minimum read from the air state's own copy of
+          // MinBodyFlipTimeVsUpY (air state +0x174, 0.8 s upright to 1.2 s tilted). That copy is built
+          // from constants in the air state's constructor (0x4809f40), never from
+          // Gameplay/SkatePhysicsTuning, so editing the tuning value does nothing. When the test fails
+          // the request falls through to the body spin controller: a flat-ground flip trick
+          // (about 0.68 s of air) turns the flip input into a spin.
+          //
+          //   0x48148eb  vmovss  xmm1, [rbx+0x418]   ; estimated air time
+          //   0x48148f3  vcomiss xmm1, xmm0           ; xmm0 = minimum from the graph
+          //   0x48148f7  jbe     0x4814918            ; too short: no body flip   <- patched
+          //   0x48148f9  ...                          ; start the body flip, [rbx+0x433] = 1
+          //
+          // Nate Pop replaces the 2-byte jbe with two NOPs, so a requested body flip always starts.
+          // Rotation, landing and bail checks are untouched.
+          inline constexpr Fingerprint gate_contract{0x48148eb, {
+              0xc5,0xfa,0x10,0x8b,0x18,0x04,0x00,0x00,0xc5,0xf8,0x2f,0xc8,0x76,0x1f,0x44,0x0f,
+              0xb6,0x83,0x39,0x04,0x00,0x00,0x40,0x80,0xe7,0x01,0x40,0x0f,0xb6,0xd7,0x48,0x8b}};
+          inline constexpr std::uintptr_t gate_branch = 0x48148f7;
+          inline constexpr std::array<unsigned char, 2> gate_original{0x76, 0x1f}; // jbe +0x1f
+          inline constexpr std::array<unsigned char, 2> gate_patched{0x90, 0x90};  // nop; nop
+          } // namespace dingosdk::game::build::v20260929::nate_pop
+          NATEPOP_EOF
+
+          cat > Extension/Skater/nate_pop.h <<'NATEPOP_EOF'
+          #pragma once
+          // Nate Pop: body flips from flat ground. Removes the game's minimum-air-time test for starting
+          // a body flip (Engine/Game/Build/20260929/nate_pop.h), so a flip trick's short air no longer
+          // turns the flip input into a spin. Off unless switched on with `natepop 1`.
+          #include <string>
+
+          namespace dingosdk::nate_pop {
+          // Patches or restores the gate. Returns false (and says why in `why`) when this game build's
+          // code is not the known one; nothing is written then.
+          bool set_enabled(bool on, std::string *why = nullptr) noexcept;
+          bool enabled() noexcept;
+          } // namespace dingosdk::nate_pop
+          NATEPOP_EOF
+
+          cat > Extension/Skater/nate_pop.cpp <<'NATEPOP_EOF'
+          #include "nate_pop.h"
+          #include "Engine/Core/Log/logging.h"
+          #include "Engine/Game/Build/20260929/nate_pop.h"
+          #include <windows.h>
+          #include <atomic>
+          #include <cstring>
+
+          namespace dingosdk::nate_pop {
+          namespace addr = game::build::v20260929::nate_pop;
+          namespace {
+          std::atomic<bool> on{};
+
+          std::uintptr_t image_base() noexcept { return reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)); }
+
+          // The fingerprint with the branch either as shipped or as Nate Pop leaves it.
+          bool known_code(std::uintptr_t base) noexcept {
+              __try {
+                  const auto *code = reinterpret_cast<const unsigned char *>(base + addr::gate_contract.rva);
+                  auto expected = addr::gate_contract.bytes;
+                  if (std::memcmp(code, expected.data(), expected.size()) == 0) return true;
+                  const auto at = addr::gate_branch - addr::gate_contract.rva;
+                  std::memcpy(expected.data() + at, addr::gate_patched.data(), addr::gate_patched.size());
+                  return std::memcmp(code, expected.data(), expected.size()) == 0;
+              } __except (EXCEPTION_EXECUTE_HANDLER) {
+                  return false;
+              }
+          }
+
+          bool write_branch(std::uintptr_t base, const std::array<unsigned char, 2> &bytes) noexcept {
+              auto *target = reinterpret_cast<void *>(base + addr::gate_branch);
+              DWORD old{};
+              if (!VirtualProtect(target, bytes.size(), PAGE_EXECUTE_READWRITE, &old)) return false;
+              // Two bytes inside one instruction slot: a single 16-bit store, so a thread running the
+              // update sees either the old branch or both NOPs, never half of each.
+              std::uint16_t value{};
+              std::memcpy(&value, bytes.data(), sizeof value);
+              reinterpret_cast<std::atomic<std::uint16_t> *>(target)->store(value, std::memory_order_release);
+              DWORD ignored{};
+              VirtualProtect(target, bytes.size(), old, &ignored);
+              FlushInstructionCache(GetCurrentProcess(), target, bytes.size());
+              return true;
+          }
+          } // namespace
+
+          bool set_enabled(bool enable, std::string *why) noexcept {
+              try {
+                  const auto base = image_base();
+                  if (!base || !known_code(base)) {
+                      if (why) *why = "this game build's body flip code is not the known one (game build 25414733 is supported).";
+                      logging::write(logging::Level::warning, logging::Channel::skater, "Nate Pop: unknown body flip code; nothing changed.");
+                      return false;
+                  }
+                  if (!write_branch(base, enable ? addr::gate_patched : addr::gate_original)) {
+                      if (why) *why = "the game's code could not be made writable.";
+                      return false;
+                  }
+                  on.store(enable, std::memory_order_relaxed);
+                  logging::write(logging::Level::info, logging::Channel::skater,
+                                 enable ? "Nate Pop on: body flips start regardless of air time."
+                                        : "Nate Pop off: the game's minimum air time for body flips is back.");
+                  return true;
+              } catch (...) {
+                  if (why) *why = "unexpected error.";
+                  return false;
+              }
+          }
+
+          bool enabled() noexcept { return on.load(std::memory_order_relaxed); }
+          } // namespace dingosdk::nate_pop
+          NATEPOP_EOF
+
+          cat > ../natepop_command.txt <<'NATEPOP_EOF'
+              {
+                  // Nate Pop: body flips from flat ground (nate_pop.h).
+                  auto entry = variable("natepop", "Body flips from flat ground: no minimum air time to start a flip",
+                                        Group::movement, argument("0|1", Type::boolean));
+                  entry.inspect = [](const Model &) { return boolean_state(true, nate_pop::enabled()); };
+                  entry.run = [](const Model &, const Values &args, const Output &out) {
+                      const bool on = std::get<bool>(args[0]);
+                      std::string why;
+                      if (!nate_pop::set_enabled(on, &why)) {
+                          out("error: " + why);
+                          return;
+                      }
+                      out(on ? "Nate Pop on: body flips start however short the air." : "Nate Pop off.");
+                  };
+                  entry.reset = [](const Model &, const Output &) { (void)nate_pop::set_enabled(false); };
+                  registry.add(std::move(entry));
+              }
+          NATEPOP_EOF
+
+          python - <<'NATEPOP_EOF'
+          import pathlib, sys
+          cc = pathlib.Path("Extension/Skater/console_commands.cpp")
+          s = cc.read_text(encoding="utf-8")
+          anchor = "void register_movement_commands(Commands &registry) {\n"
+          inc = '#include "ai_skaters.h"\n'
+          if anchor not in s or inc not in s:
+              sys.exit("console_commands.cpp: anchor not found in this ReSkate version")
+          if "nate_pop" not in s:
+              block = pathlib.Path("../natepop_command.txt").read_text(encoding="utf-8")
+              s = s.replace(inc, inc + '#include "nate_pop.h"\n', 1)
+              s = s.replace(anchor, anchor + block, 1)
+              cc.write_text(s, encoding="utf-8")
+          rc = pathlib.Path("cmake/Runtime.cmake")
+          t = rc.read_text(encoding="utf-8")
+          line = "    Extension/Skater/no_bail.cpp\n"
+          if line not in t:
+              sys.exit("Runtime.cmake: no_bail.cpp line not found in this ReSkate version")
+          if "nate_pop.cpp" not in t:
+              rc.write_text(t.replace(line, line + "    Extension/Skater/nate_pop.cpp\n", 1), encoding="utf-8")
+          print("Nate Pop added.")
+          NATEPOP_EOF
+
+          # Leave out the Spotify Connect helper (a Rust build that needs network fetches).
+          if [ -d SpotifyHelper ]; then mv SpotifyHelper SpotifyHelper.off; fi
+          git --no-pager diff --stat
+
+      - name: Configure
+        working-directory: reskate
+        run: cmake --preset vs2022-x64
+
+      - name: Build
+        working-directory: reskate
+        run: cmake --build --preset release --parallel 4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "ReSkate_NatePop_$env:RESKATE_REF"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $rel = "reskate/build/vs2022-x64/Release"
+          foreach ($f in "ReSkate.dll", "ReSkateLauncher.exe") {
+            $p = Get-ChildItem -Path $rel -Recurse -Filter $f | Select-Object -First 1
+            if (-not $p) { throw "$f was not built" }
+            Copy-Item $p.FullName $out
+          }
+          "ARTIFACT=$out" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}/
